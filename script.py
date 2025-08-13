@@ -15,7 +15,7 @@ from telethon.tl.types import InputInvoiceStarGift, InputPeerSelf
 from dotenv import load_dotenv
 
 # ---------------------------
-# Core logic
+# Core logic (adapted from your script)
 # ---------------------------
 
 load_dotenv()
@@ -47,7 +47,6 @@ class GiftBuyer:
         self._client: Optional[TelegramClient] = None
 
     def stop(self):
-        # Can be called from non-async thread via call_soon_threadsafe
         if self._client and self._client.loop.is_running():
             self._client.loop.call_soon_threadsafe(self._stop_event.set)
 
@@ -65,7 +64,6 @@ class GiftBuyer:
                 self.log(f"Баланс: {balance:.0f} ⭐")
             except AuthKeyUnregisteredError:
                 self.log("Требуется авторизация — сейчас откроется окно входа в Telegram в консоли...")
-                # Reopen to force login flow in the same session
                 async with TelegramClient(self.cfg.session, API_ID, API_HASH) as _:
                     pass
                 self.log("Авторизация завершена. Перезапустите покупатель.")
@@ -102,13 +100,14 @@ class GiftBuyer:
                     if limited and not sold_out and (remains is None or remains > 0) and price <= self.cfg.max_price_stars:
                         candidates.append((price, g))
 
-                candidates.sort(key=lambda x: x[0])
+                # Сначала дорогие, потом дешёвые
+                candidates.sort(key=lambda x: x[0], reverse=True)
 
+                purchases = 0
                 for price, gift in candidates:
                     if self._stop_event.is_set():
                         break
 
-                    # refresh balance before buy
                     status = await client(functions.payments.GetStarsStatusRequest(peer=InputPeerSelf()))
                     balance = stars_value(getattr(status, "balance", 0))
 
@@ -116,10 +115,7 @@ class GiftBuyer:
                         self.log(f"Пропуск — не хватает Stars ({balance} < {price})")
                         continue
 
-                    invoice = InputInvoiceStarGift(
-                        peer=to_peer,
-                        gift_id=gift.id,
-                    )
+                    invoice = InputInvoiceStarGift(peer=to_peer, gift_id=gift.id)
 
                     try:
                         form = await client(functions.payments.GetPaymentFormRequest(invoice=invoice))
@@ -129,18 +125,19 @@ class GiftBuyer:
 
                     if isinstance(form, (types.payments.PaymentFormStarGift, types.payments.PaymentFormStars)):
                         try:
-                            result = await client(functions.payments.SendStarsFormRequest(
+                            await client(functions.payments.SendStarsFormRequest(
                                 form_id=form.form_id,
                                 invoice=invoice,
                             ))
                             self.log(f"✅ Куплено: {gift.id} за {price} ⭐")
-                            return  # остановимся после первой покупки
+                            purchases += 1
                         except Exception as e:
                             self.log(f"Ошибка при оплате: {e}")
                     else:
                         self.log(f"Неожиданный тип формы оплаты: {type(form)}")
 
-                await asyncio.sleep(self.cfg.poll_interval)
+                if purchases == 0:
+                    await asyncio.sleep(self.cfg.poll_interval)
 
 
 # ---------------------------
@@ -159,7 +156,6 @@ class App(tk.Tk):
         self.current_runner: Optional[GiftBuyer] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Controls
         self._build_form()
         self._build_log()
         self._after_poll()
@@ -168,34 +164,28 @@ class App(tk.Tk):
         frm = ttk.Frame(self)
         frm.pack(fill=tk.X, padx=12, pady=12)
 
-        # Session
         ttk.Label(frm, text="Session файл:").grid(row=0, column=0, sticky=tk.W, padx=4, pady=4)
         self.session_var = tk.StringVar(value=DEFAULT_SESSION)
         ttk.Entry(frm, textvariable=self.session_var, width=40).grid(row=0, column=1, sticky=tk.W, padx=4, pady=4)
 
-        # Recipient
         ttk.Label(frm, text="Получатель (@username / ID / me):").grid(row=1, column=0, sticky=tk.W, padx=4, pady=4)
         self.recipient_var = tk.StringVar(value=os.getenv("RECIPIENT", "me"))
         ttk.Entry(frm, textvariable=self.recipient_var, width=40).grid(row=1, column=1, sticky=tk.W, padx=4, pady=4)
 
-        # Max price
         ttk.Label(frm, text="Макс. цена (⭐):").grid(row=2, column=0, sticky=tk.W, padx=4, pady=4)
         self.max_price_var = tk.IntVar(value=int(os.getenv("MAX_PRICE_STARS", "500")))
         ttk.Spinbox(frm, from_=1, to=10_000, textvariable=self.max_price_var, width=10).grid(row=2, column=1, sticky=tk.W, padx=4, pady=4)
 
-        # Poll interval
         ttk.Label(frm, text="Интервал опроса (сек):").grid(row=3, column=0, sticky=tk.W, padx=4, pady=4)
         self.poll_var = tk.IntVar(value=int(os.getenv("POLL_INTERVAL", "15")))
         ttk.Spinbox(frm, from_=2, to=3600, textvariable=self.poll_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=4, pady=4)
 
-        # API status
         api_frame = ttk.Frame(frm)
         api_frame.grid(row=0, column=2, rowspan=4, padx=24, sticky=tk.NW)
         ttk.Label(api_frame, text="API статус:").pack(anchor=tk.W)
         self.api_lbl = ttk.Label(api_frame, text=self._api_status_text(), foreground=("green" if API_ID and API_HASH else "red"))
         self.api_lbl.pack(anchor=tk.W)
 
-        # Buttons
         btns = ttk.Frame(self)
         btns.pack(fill=tk.X, padx=12)
         self.start_btn = ttk.Button(btns, text="Старт", command=self.on_start)
@@ -213,7 +203,6 @@ class App(tk.Tk):
         self.text.pack(fill=tk.BOTH, expand=True)
 
     def _after_poll(self):
-        # Periodically drain log queue to Text widget
         try:
             while True:
                 line = self.log_queue.get_nowait()
@@ -294,7 +283,6 @@ class App(tk.Tk):
             except Exception as e:
                 self.log(f"Ошибка получения баланса: {e}")
 
-        # Run one-off async task in a temp loop to avoid clashing with runner loop
         threading.Thread(target=lambda: asyncio.run(_check()), daemon=True).start()
 
 
